@@ -74,9 +74,17 @@ The decode is integer-exact, so outputs are bit-identical to the int8
 checkpoint the trellis file was packed from. The int8 layers and the BF16
 keep-outs in these files are ordinary ComfyUI tensors.
 
-LoRAs work. A patched layer is requantized to plain int8, exactly as ComfyUI
-does for an INT8 ConvRot layer, so that layer stops saving memory while the
-LoRA is applied.
+LoRAs work. A plain LoRA (up/down matrices: kohya, diffusers and PEFT files)
+runs as a low-rank branch next to each trellis layer, so the layer keeps its
+compact size and the LoRA isn't rounded into int8. Measured on an RTX 3060 Ti
+with a rank-32 LoRA on every attention and MLP linear of the compact file:
+peak VRAM rose by 0.2 GiB and an image took 10 to 15% longer. Merging that
+LoRA into int8 instead, as ComfyUI does for an INT8 checkpoint, needs 7.2 GiB.
+
+Other patch types (DoRA, LoHa, LoKr, full diffs) requantize the layer to
+plain int8, as on the official INT8 checkpoint. Under dynamic VRAM (ComfyUI's
+default on NVIDIA) that can't be written back into a trellis layer, so they
+are skipped with a warning; use the int8 file or `--disable-dynamic-vram`.
 
 The pack can be installed next to other node packs that hook ComfyUI's
 quantized loader. Formats it doesn't know pass through to the previous hook.
@@ -84,7 +92,8 @@ quantized loader. Formats it doesn't know pass through to the previous hook.
 ## Files in this pack
 
 * `prism_trellis.py`: the `prism_trellis` layout (forward, fused input
-  activation, LoRA requantize, save) and its loader.
+  activation, requantize for patches, save) and its loader.
+* `prism_trellis_lora.py`: plain LoRAs as a low-rank branch.
 * `prism_trellis_decode.py`: the NVRTC decode kernel and its torch fallback.
 * `prism_trellis_file.py`: the file format and the reference decoder.
 * `prism_trellis_hook.py`: routes `prism_trellis` layers from ComfyUI's

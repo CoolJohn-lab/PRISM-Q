@@ -11,7 +11,9 @@ The payload stays resident (as big-endian int32 words) and each call decodes the
 transient int8 weight (prism_trellis_decode.py, a CUDA kernel compiled at first use with NVRTC) for comfy_kitchen's
 int8_linear with ConvRot, the exact kernel call of the official INT8 ConvRot checkpoint, so outputs are bit-identical
 to the expanded checkpoint while the weights take Kb + 5/256 bits in VRAM. Loading goes through the stock "Load
-Diffusion Model" node via prism_trellis_hook. A LoRA patch requantizes the layer to plain int8 (it can no longer be a trellis path), as ConvRot does.
+Diffusion Model" node via prism_trellis_hook. A plain LoRA runs as a low-rank branch next to the trellis weight
+(prism_trellis_lora.py); other patch types requantize the layer to plain int8, as ConvRot does (not possible
+under dynamic VRAM, where they are skipped).
 """
 import dataclasses
 import logging
@@ -27,9 +29,12 @@ from comfy_kitchen.tensor.int8 import TensorWiseINT8Layout, _dtype_code
 
 from . import prism_trellis_decode as td
 from . import prism_trellis_hook
+from . import prism_trellis_lora
 
 FORMAT = td.trellis_file.QUANT_FORMAT
 LAYOUT = 'PrismTrellisLayout'
+prism_trellis_lora.LAYOUT = LAYOUT
+prism_trellis_lora.install()
 
 
 class PrismTrellisLayout(QuantizedLayout):
@@ -176,13 +181,18 @@ def linear_input_act(linear, x, input_act, act_weight=None, act_eps=0.0, residua
                                                               want_requant=True)
     try:
         if not isinstance(weight, QuantizedTensor):
-            out = torch.nn.functional.linear(comfy.ops._eager_input_act(x, input_act, act_weight, act_eps), weight, bias)
+            xa = comfy.ops._eager_input_act(x, input_act, act_weight, act_eps)
+            out = prism_trellis_lora.add_lora(linear, xa, torch.nn.functional.linear(xa, weight, bias))
             return out if residual is None else torch.addcmul(residual, out, residual_scale)
         w8, scale = PrismTrellisLayout.get_plain_tensors(weight)
-        return comfy.quant_ops.ck.int8_linear(
+        out = comfy.quant_ops.ck.int8_linear(
             x, w8, scale, bias, x.dtype, convrot=weight._params.convrot,
             convrot_groupsize=weight._params.convrot_groupsize, input_act=input_act, input_act_weight=act_weight,
             input_act_eps=act_eps, residual=residual, residual_scale=residual_scale)
+        if getattr(linear, 'prism_lora', None):  # the branch sees the activated input; the residual scale applies to it
+            prism_trellis_lora.add_lora(linear, comfy.ops._eager_input_act(x, input_act, act_weight, act_eps), out,
+                                        residual_scale if residual is not None else None)
+        return out
     finally:
         comfy.ops.uncast_bias_weight(linear, weight, bias, offload_stream)
 
@@ -229,6 +239,9 @@ def _load(module, super_load, state_dict, prefix, layer_conf, local_metadata, st
         levels=levels, convrot=bool(layer_conf.get('convrot', True)),
         convrot_groupsize=int(layer_conf.get('convrot_groupsize', 256)), plain=plain)
     module.weight = torch.nn.Parameter(QuantizedTensor(qdata, LAYOUT, params), requires_grad=False)
+    if not getattr(module, 'prism_lora_hook', False):
+        module.register_forward_hook(prism_trellis_lora.forward_hook)
+        module.prism_lora_hook = True
     super_load(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
     for key in loaded:
         if key in missing_keys:
